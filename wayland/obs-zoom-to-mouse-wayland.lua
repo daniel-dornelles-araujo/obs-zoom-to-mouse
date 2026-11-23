@@ -219,7 +219,7 @@ local function get_mouse_pos_qdbus()
 end
 
 -- File path for KWin script to write cursor position
-local CURSOR_POS_FILE = "/tmp/obs-zoom-cursor-pos"
+local CURSOR_POS_FILE = nil  -- set below once Flatpak detection has run
 local kwin_script_installed = false
 
 -- Install KWin script to track cursor position
@@ -322,15 +322,45 @@ local function get_mouse_pos_kwin_script()
     return { x = 0, y = 0, valid = false }
 end
 
+-- Cursor position written by kwin-cursor-helper.py (runs on the host).
+-- Format: "cx,cy[,wx,wy,ww,wh]" - cursor and frame geometry of the tracked
+-- window, all in global logical coordinates.
+local kde_window_mode = false   -- source is a single-window capture
+local kde_window_match = ""     -- resourceClass/caption substring ("" = active window)
+local kde_window_geom = nil     -- { x, y, w, h } of tracked window
+
+local in_flatpak = (function()
+    local f = io.open("/.flatpak-info", "r")
+    if f then f:close(); return true end
+    return false
+end)()
+
+local function get_cursor_file_path()
+    local runtime = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
+    local app_id = os.getenv("FLATPAK_ID")
+    if in_flatpak and app_id then
+        -- $XDG_RUNTIME_DIR/app/<id> is the same directory inside and outside the sandbox
+        return runtime .. "/app/" .. app_id .. "/obs-zoom-cursor-pos"
+    end
+    return runtime .. "/obs-zoom-cursor-pos"
+end
+CURSOR_POS_FILE = get_cursor_file_path()
+
 -- Fast cursor position using file-based communication
 local function get_mouse_pos_file()
     local f = io.open(CURSOR_POS_FILE, "r")
     if f then
-        local content = f:read("*a")
+        local content = f:read("*l")
         f:close()
         if content then
-            local x, y = content:match("(-?%d+),(-?%d+)")
+            local x, y, wx, wy, ww, wh = content:match("^(-?%d+),(-?%d+),(-?%d+),(-?%d+),(%d+),(%d+)")
+            if x then
+                kde_window_geom = { x = tonumber(wx), y = tonumber(wy), w = tonumber(ww), h = tonumber(wh) }
+                return { x = tonumber(x), y = tonumber(y), valid = true }
+            end
+            x, y = content:match("^(-?%d+),(-?%d+)")
             if x and y then
+                kde_window_geom = nil
                 return { x = tonumber(x), y = tonumber(y), valid = true }
             end
         end
@@ -338,69 +368,42 @@ local function get_mouse_pos_file()
     return { x = 0, y = 0, valid = false }
 end
 
--- Start background cursor position updater using streaming journal
+local function shell_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- Run a command on the host (escapes the Flatpak sandbox if needed)
+local function host_cmd(cmd)
+    if in_flatpak then return "flatpak-spawn --host " .. cmd end
+    return cmd
+end
+
+pcall(ffi.cdef, [[ int getpid(void); ]])
+
+-- Start the host-side KWin cursor helper (replaces any running instance)
 local cursor_updater_running = false
 local function start_cursor_updater()
-    if cursor_updater_running then return end
-    
-    -- First, create a KWin script that emits cursor position on every move
-    local kwin_script = [[
-// OBS Zoom to Mouse - Cursor Tracker for KDE Wayland
-// This script prints cursor position whenever it changes
-
-workspace.cursorPosChanged.connect(function() {
-    var pos = workspace.cursorPos;
-    print("CURSOR_POS:" + pos.x + "," + pos.y);
-});
-
-// Print initial position
-var initPos = workspace.cursorPos;
-print("CURSOR_POS:" + initPos.x + "," + initPos.y);
-]]
-    
-    local kwin_script_path = "/tmp/obs-cursor-tracker.js"
-    local f = io.open(kwin_script_path, "w")
-    if f then
-        f:write(kwin_script)
-        f:close()
+    local helper = script_path() .. "kwin-cursor-helper.py"
+    local args = " --out " .. shell_quote(CURSOR_POS_FILE) .. " --window " .. shell_quote(kde_window_match)
+    local cmd
+    if in_flatpak then
+        -- --watch-bus: helper exits when OBS disconnects from the session bus
+        cmd = "flatpak-spawn --host --watch-bus python3 " .. shell_quote(helper) .. args
+    else
+        cmd = "python3 " .. shell_quote(helper) .. args .. " --parent-pid " .. ffi.C.getpid()
     end
-    
-    -- Create a streaming updater that uses journalctl -f
-    -- Note: Using [=[ ]=] delimiters to avoid conflict with bash [[ ]]
-    local updater_script = [=[#!/bin/bash
-# OBS Zoom to Mouse - Cursor Position Updater for KDE Wayland
-CURSOR_FILE="/tmp/obs-zoom-cursor-pos"
-KWIN_SCRIPT="/tmp/obs-cursor-tracker.js"
+    os.remove(CURSOR_POS_FILE)
+    os.execute(cmd .. " >/dev/null 2>&1 &")
+    cursor_updater_running = true
+    log("Started KWin cursor helper: " .. cmd)
+end
 
-# Unload any previous instance
-qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript obs-cursor-tracker 2>/dev/null
-
-# Load the cursor tracking script
-qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$KWIN_SCRIPT" obs-cursor-tracker 2>/dev/null
-qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.start 2>/dev/null
-
-# Initialize with a query
-sleep 0.1
-
-# Follow the journal and extract cursor positions in real-time
-exec journalctl --user -u plasma-kwin_wayland -f -o cat 2>/dev/null | while IFS= read -r line; do
-    if [[ "$line" == CURSOR_POS:* ]]; then
-        POS="${line#CURSOR_POS:}"
-        echo "$POS" > "$CURSOR_FILE"
-    fi
-done
-]=]
-    
-    local updater_path = "/tmp/obs-cursor-updater.sh"
-    f = io.open(updater_path, "w")
-    if f then
-        f:write(updater_script)
-        f:close()
-        os.execute("chmod +x " .. updater_path)
-        os.execute("nohup " .. updater_path .. " >/dev/null 2>&1 &")
-        cursor_updater_running = true
-        log("Started cursor position updater (streaming mode)")
-    end
+local function stop_cursor_updater()
+    if not cursor_updater_running then return end
+    os.execute(host_cmd("pkill -f '^python3 .*[k]win-cursor-helper[.]py'") .. " >/dev/null 2>&1")
+    os.remove(CURSOR_POS_FILE)
+    cursor_updater_running = false
+    kde_window_geom = nil
 end
 
 -- Get mouse position via busctl (systemd's D-Bus tool - legacy method)
@@ -489,27 +492,10 @@ local function get_mouse_pos_wayland()
     local result = { x = 0, y = 0, valid = false }
     
     if wayland_desktop == "kde" then
-        -- Primary method: read from file (updated by background process)
+        -- Read from file written by kwin-cursor-helper.py. (The old D-Bus /
+        -- journal fallbacks don't work on Plasma 6 and spawn a process on
+        -- every poll, so they are no longer used.)
         result = get_mouse_pos_file()
-        
-        -- If file method fails, try KWin script query
-        if not result.valid then
-            result = get_mouse_pos_kwin_script()
-        end
-        
-        -- Legacy D-Bus methods (may not work in Plasma 6)
-        if not result.valid then
-            result = get_mouse_pos_busctl()
-        end
-        if not result.valid then
-            result = get_mouse_pos_dbus_send()
-        end
-        if not result.valid then
-            result = get_mouse_pos_qdbus()
-        end
-        if not result.valid then
-            result = get_mouse_pos_kde_dbus()
-        end
     elseif wayland_desktop == "wlroots" then
         -- Try Hyprland first, then Sway
         result = get_mouse_pos_hyprland()
@@ -808,6 +794,11 @@ local function get_target_position(zoom)
         if monitor_override_sy > 0 then
             mouse.y = mouse.y * monitor_override_sy
         end
+    elseif kde_window_mode and kde_window_geom and kde_window_geom.w > 0 and kde_window_geom.h > 0 then
+        -- Window capture: KWin streams the window's frame geometry, scaled to
+        -- the source's pixel size (HiDPI). Map global cursor -> source pixels.
+        mouse.x = (mouse.x - kde_window_geom.x) * (zoom.source_size.width / kde_window_geom.w)
+        mouse.y = (mouse.y - kde_window_geom.y) * (zoom.source_size.height / kde_window_geom.h)
     elseif monitor_info then
         mouse.x = mouse.x - monitor_info.x
         mouse.y = mouse.y - monitor_info.y
@@ -971,6 +962,17 @@ function script_properties()
     obs.obs_properties_add_bool(props, "follow_auto_lock", "Auto Lock on reverse direction ")
     obs.obs_properties_add_bool(props, "allow_all_sources", "Allow any zoom source ")
 
+    if wayland_desktop == "kde" then
+        local win_props = obs.obs_properties_create()
+        local match = obs.obs_properties_add_text(win_props, "kde_window_match",
+            "Window to track (app class or title text; empty = active window)", obs.OBS_TEXT_DEFAULT)
+        obs.obs_property_set_long_description(match,
+            "Case-insensitive substring of the window's resource class (e.g. 'firefox', 'code') or title. " ..
+            "The first matching window is used; if nothing matches, the active window is used.")
+        obs.obs_properties_add_group(props, "kde_window_mode", "Source captures a single window (KDE) ",
+            obs.OBS_GROUP_CHECKABLE, win_props)
+    end
+
     local override_props = obs.obs_properties_create()
     obs.obs_properties_add_text(override_props, "monitor_override_label", "", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_int(override_props, "monitor_override_x", "X", -10000, 10000, 1)
@@ -1030,6 +1032,8 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "socket_port", 12345)
     obs.obs_data_set_default_int(settings, "socket_poll", 10)
     obs.obs_data_set_default_bool(settings, "debug_logs", false)
+    obs.obs_data_set_default_bool(settings, "kde_window_mode", false)
+    obs.obs_data_set_default_string(settings, "kde_window_match", "")
 end
 
 function script_load(settings)
@@ -1067,6 +1071,8 @@ function script_load(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+    kde_window_mode = obs.obs_data_get_bool(settings, "kde_window_mode")
+    kde_window_match = obs.obs_data_get_string(settings, "kde_window_match")
 
     obs.obs_frontend_add_event_callback(on_frontend_event)
 
@@ -1111,23 +1117,9 @@ function script_unload()
         wayland_poll_timer_active = false
     end
     
-    -- Stop background cursor updater for KDE Wayland
-    if cursor_updater_running then
-        os.execute("pkill -f obs-cursor-updater.sh 2>/dev/null")
-        cursor_updater_running = false
-    end
-    
-    -- Unload KWin helper scripts
-    os.execute("qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript obs-cursor-helper 2>/dev/null")
-    os.execute("qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript obs-cursor-tracker 2>/dev/null")
-    kwin_script_installed = false
-    
-    -- Cleanup temp files
-    os.remove("/tmp/obs-cursor-helper.js")
-    os.remove("/tmp/obs-cursor-query.js")
-    os.remove("/tmp/obs-cursor-tracker.js")
-    os.remove("/tmp/obs-cursor-updater.sh")
-    os.remove("/tmp/obs-zoom-cursor-pos")
+    -- Stop the host-side KWin cursor helper (it unloads its KWin script and
+    -- removes the cursor file on exit)
+    stop_cursor_updater()
     
     if x11_lib ~= nil and x11_display ~= nil then x11_lib.XCloseDisplay(x11_display); x11_display=nil; x11_lib=nil end
     if socket_server ~= nil then obs.timer_remove(on_socket_timer); socket_server:close(); socket_server=nil; socket_mouse=nil end
@@ -1143,6 +1135,7 @@ function script_update(settings)
     local old_socket = use_socket
     local old_port = socket_port
     local old_poll = socket_poll
+    local old_window_match = kde_window_match
 
     source_name = obs.obs_data_get_string(settings, "source")
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
@@ -1167,6 +1160,12 @@ function script_update(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+    kde_window_mode = obs.obs_data_get_bool(settings, "kde_window_mode")
+    kde_window_match = obs.obs_data_get_string(settings, "kde_window_match")
+
+    if cursor_updater_running and kde_window_match ~= old_window_match then
+        start_cursor_updater()  -- new instance replaces the old one
+    end
 
     if source_name ~= prev_source and is_obs_loaded then
         refresh_sceneitem(true)
