@@ -30,3 +30,16 @@ stuck in a corner. In the script settings:
 
 The window's position, size and HiDPI scaling are tracked live, so you can
 move or resize the window while recording.
+
+## Hotkeys don't work outside the OBS Window
+
+On KDE Plasma with Wayland, Hotkeys need to be configured in KDE, not in OBS, or they will only work when the OBS Window is active.
+
+But first KDE need to know those shortcuts exist. Use the `obs-wayland-hotkeys` plugin to create entries in the KDE system settings and bind them to OBS.
+
+1. Install the plugin:
+	• Flatpak: Install com.obsproject.Studio.Plugin.WaylandHotkeys via Flathub or your software center.
+	• Arch / AUR: Install obs-wayland-hotkeys or obs-wayland-hotkeys-git.
+	• Fedora / Other: Install via COPR (obs-studio-plugin-wayland-hotkeys) or build from the GitHub repo.
+2. Register shortcuts: Restart OBS; a KDE system prompt will appear asking to register global shortcuts.
+3. Bind your keys in KDE: Open KDE System Settings > Keyboard > Shortcuts > OBS Studio to assign your actual key combinations. (Note: If you later add new scenes in OBS, you may need to remove the OBS entry in KDE Shortcuts and restart OBS so it refreshes the list).
